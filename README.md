@@ -130,4 +130,7 @@ python3 -m venv .venv
 
 ## License
 
-Mozilla Public License 2.0 (matching go-plugin).
+MIT. The vendored `.proto` files in `src/pyplugin/proto/` and
+`fixtures/example_kv/proto/` retain their upstream MPL-2.0 headers from
+[hashicorp/go-plugin](https://github.com/hashicorp/go-plugin); MPL-2.0 is
+file-level and compatible with MIT for the rest of the project.

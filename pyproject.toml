@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Wire-compatible Python port of HashiCorp's go-plugin"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MPL-2.0"
+license = "MIT"
 authors = [{ name = "Max Lund" }]
 dependencies = [
     "grpcio>=1.60",
