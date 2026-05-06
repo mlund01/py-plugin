@@ -1,0 +1,12 @@
+// Vendored from hashicorp/go-plugin internal/plugin/grpc_controller.proto
+// SPDX-License-Identifier: MPL-2.0
+syntax = "proto3";
+package plugin;
+option go_package = "github.com/hashicorp/go-plugin/internal/plugin";
+
+message Empty {
+}
+
+service GRPCController {
+    rpc Shutdown(Empty) returns (Empty);
+}

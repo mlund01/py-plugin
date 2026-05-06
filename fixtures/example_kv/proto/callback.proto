@@ -1,0 +1,11 @@
+// A tiny host-side callback service for broker-roundtrip tests.
+// The plugin asks the host (via the broker) for a channel back to this.
+syntax = "proto3";
+package proto;
+
+service Callback {
+  rpc Notify(NotifyRequest) returns (NotifyResponse);
+}
+
+message NotifyRequest { string note = 1; }
+message NotifyResponse { string echo = 1; }

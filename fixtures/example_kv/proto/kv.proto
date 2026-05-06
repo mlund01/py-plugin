@@ -1,0 +1,17 @@
+// Mirrors hashicorp/go-plugin examples/grpc — a tiny KV plugin used in smoke tests.
+syntax = "proto3";
+package proto;
+
+service KV {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (Empty);
+  // Plugin dials back into the host on broker_id and calls Callback.Notify().
+  rpc PingHost(PingHostRequest) returns (PingHostResponse);
+}
+
+message GetRequest { string key = 1; }
+message GetResponse { bytes value = 1; }
+message PutRequest { string key = 1; bytes value = 2; }
+message PingHostRequest { uint32 broker_id = 1; string note = 2; }
+message PingHostResponse { string echo = 1; }
+message Empty {}
