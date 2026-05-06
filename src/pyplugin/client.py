@@ -1,34 +1,26 @@
-"""Host-side ``Client`` — spawns a plugin, performs handshake, dispenses stubs.
+"""Host-side ``Client`` — spawns a plugin, performs handshake, dispenses stubs (grpclib async).
 
-Mirrors go-plugin's ``Client`` (client.go) plus ``GRPCClient`` (grpc_client.go):
-
-* ``start()`` spawns the subprocess, sets cookie + AutoMTLS env vars, reads
-  the handshake line from stdout (with ``start_timeout``), validates it,
-  dials the gRPC channel, and pings the health service.
-* ``dispense(name)`` builds and returns a typed stub via ``Plugin.grpc_client``.
-* ``kill()`` walks the shutdown ladder: GRPCController.Shutdown RPC → wait
-  ``kill_timeout`` for clean exit → SIGTERM → wait → SIGKILL.
-
-Reattach: if a ``ReattachConfig`` is supplied instead of ``cmd``, ``start()``
-skips the spawn and goes straight to the dial.
+API: an ``async`` Client. Use as ``async with Client(config) as c:`` and
+``stub = c.dispense('name'); await stub.SomeMethod(req)`` — the dispensed
+stubs are grpclib async stubs.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import ssl
 import subprocess
-import threading
-import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence, Union
 
-import grpc
-from grpc_health.v1 import health_pb2, health_pb2_grpc
+from grpclib.client import Channel
+from grpclib.config import Configuration
+from grpclib.health.v1 import health_grpc, health_pb2
 
 from . import logging_bridge, mtls, process, transport
-from ._generated import grpc_controller_pb2, grpc_controller_pb2_grpc
-from .broker import GRPCBroker, make_client_side_broker
+from ._generated import grpc_controller_grpc, grpc_controller_pb2
+from .broker import GRPCBroker, TLSMaterial, make_client_side_broker
 from .errors import (
     AppProtocolMismatch,
     HandshakeError,
@@ -84,40 +76,41 @@ class Client:
         self._stderr_logger = config.stderr_logger or self._logger.getChild("stderr")
         self._proc: Optional[subprocess.Popen] = None
         self._handshake: Optional[HandshakeLine] = None
-        self._channel: Optional[grpc.Channel] = None
+        self._channel: Optional[Channel] = None
         self._broker: Optional[GRPCBroker] = None
-        self._broker_thread: Optional[threading.Thread] = None
-        self._stderr_thread: Optional[threading.Thread] = None
+        self._broker_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
         self._negotiated_version: int = 0
         self._plugin_set: PluginSet = {}
-        self._tls: Optional[dict[str, bytes]] = None  # populated when AutoMTLS
-        self._exited = threading.Event()
+        self._tls: Optional[dict[str, bytes]] = None
+        self._client_ssl: Optional[ssl.SSLContext] = None
         self._killed = False
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
 
     # ----- public API -----
 
-    def start(self) -> None:
-        with self._lock:
+    async def start(self) -> None:
+        async with self._lock:
             if self._channel is not None:
                 return
             if self._cfg.reattach is not None:
                 self._reattach()
             else:
-                self._spawn_and_handshake()
-            self._dial()
+                await self._spawn_and_handshake()
+            await self._dial()
 
     def dispense(self, name: str) -> Any:
-        self.start()
+        if self._channel is None:
+            raise RuntimeError("Client.start() must be awaited before dispense()")
         if name not in self._plugin_set:
             raise KeyError(f"unknown plugin: {name!r}")
         plug = self._plugin_set[name]
-        return plug.grpc_client(self._broker, self._channel)  # type: ignore[arg-type]
+        return plug.stub(self._broker, self._channel)  # type: ignore[arg-type]
 
     @property
     def broker(self) -> GRPCBroker:
-        self.start()
-        assert self._broker is not None
+        if self._broker is None:
+            raise RuntimeError("Client.start() must be awaited before broker access")
         return self._broker
 
     @property
@@ -135,7 +128,6 @@ class Client:
     def reattach_config(self) -> ReattachConfig | None:
         if self._handshake is None:
             return None
-        # Reattach inherits the ORIGINAL handshake/cert.
         cert_b64 = self._handshake.server_cert
         server_cert_pem = (
             mtls.der_to_pem(mtls.decode_handshake_cert(cert_b64)) if cert_b64 else None
@@ -153,65 +145,73 @@ class Client:
             client_key_pem=client_key,
         )
 
-    def kill(self) -> None:
-        """Walk the shutdown ladder: Shutdown RPC → SIGTERM → SIGKILL."""
+    async def kill(self) -> None:
+        """Walk the shutdown ladder: GRPCController.Shutdown → SIGTERM → SIGKILL."""
         if self._killed:
             return
         self._killed = True
         graceful = False
         if self._channel is not None:
             try:
-                stub = grpc_controller_pb2_grpc.GRPCControllerStub(self._channel)
-                stub.Shutdown(grpc_controller_pb2.Empty(), timeout=2.0)
+                stub = grpc_controller_grpc.GRPCControllerStub(self._channel)
+                await asyncio.wait_for(
+                    stub.Shutdown(grpc_controller_pb2.Empty()),
+                    timeout=2.0,
+                )
                 graceful = True
-            except grpc.RpcError as e:
-                self._logger.debug("controller.Shutdown failed", exc_info=e)
+            except (asyncio.TimeoutError, Exception) as e:  # noqa: BLE001
+                self._logger.debug("controller.Shutdown failed: %s", e)
+        if self._broker is not None:
+            try:
+                await self._broker.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._broker = None
+        if self._broker_task is not None:
+            self._broker_task.cancel()
+        if self._channel is not None:
             try:
                 self._channel.close()
             except Exception:  # noqa: BLE001
                 pass
             self._channel = None
-        if self._broker is not None:
-            try:
-                self._broker.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._broker = None
 
         if self._cfg.reattach is not None and self._cfg.reattach.test:
-            return  # test-mode: never kill
+            return
 
         if self._proc is None:
             return
 
-        deadline = time.monotonic() + self._cfg.kill_timeout
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + self._cfg.kill_timeout
         if graceful:
-            while time.monotonic() < deadline and self._proc.poll() is None:
-                time.sleep(0.05)
+            while loop.time() < deadline and self._proc.poll() is None:
+                await asyncio.sleep(0.05)
 
         if self._proc.poll() is None:
             self._logger.warning("plugin failed to exit gracefully — sending SIGTERM")
             process.terminate(self._proc)
-            deadline = time.monotonic() + self._cfg.kill_timeout
-            while time.monotonic() < deadline and self._proc.poll() is None:
-                time.sleep(0.05)
+            deadline = loop.time() + self._cfg.kill_timeout
+            while loop.time() < deadline and self._proc.poll() is None:
+                await asyncio.sleep(0.05)
 
         if self._proc.poll() is None:
             self._logger.error("plugin still alive after SIGTERM — sending SIGKILL")
             process.kill(self._proc)
             try:
-                self._proc.wait(timeout=2.0)
+                await asyncio.get_event_loop().run_in_executor(None, lambda: self._proc.wait(timeout=2.0))
             except subprocess.TimeoutExpired:
                 pass
 
-        self._exited.set()
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
 
-    def __enter__(self) -> "Client":
-        self.start()
+    async def __aenter__(self) -> "Client":
+        await self.start()
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.kill()
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.kill()
 
     # ----- internals -----
 
@@ -225,7 +225,6 @@ class Client:
         cookie = self._cfg.handshake_config
         env[cookie.magic_cookie_key] = cookie.magic_cookie_value
 
-        # Versioned plugins → advertise all versions we know.
         if _is_versioned(self._cfg.plugins):
             versions = sorted(self._cfg.plugins.keys())  # type: ignore[arg-type]
         else:
@@ -246,55 +245,41 @@ class Client:
 
         return env
 
-    def _spawn_and_handshake(self) -> None:
+    async def _spawn_and_handshake(self) -> None:
         env = self._build_env()
         assert self._cfg.cmd is not None
         self._proc = process.spawn(self._cfg.cmd, env=env, cwd=self._cfg.cwd)
 
-        # Stderr-forwarder thread.
+        # Async stderr forwarding.
+        loop = asyncio.get_running_loop()
         stderr = self._proc.stderr
         assert stderr is not None
-        self._stderr_thread = threading.Thread(
-            target=self._forward_stderr, args=(stderr,), name="plugin-stderr",
-            daemon=True,
-        )
-        self._stderr_thread.start()
+        self._stderr_task = loop.create_task(self._forward_stderr(stderr))
 
-        line = self._read_handshake_line()
+        line = await self._read_handshake_line()
         self._handshake = parse_line(line)
         self._validate_handshake(self._handshake)
 
-    def _read_handshake_line(self) -> str:
+    async def _read_handshake_line(self) -> str:
         assert self._proc is not None
         stdout = self._proc.stdout
         assert stdout is not None
-        line_holder: dict[str, str] = {}
-        err_holder: dict[str, BaseException] = {}
-
-        def reader() -> None:
-            try:
-                raw = stdout.readline()
-                if not raw:
-                    err_holder["e"] = ProcessExitedError(
-                        "plugin exited before sending handshake")
-                    return
-                line_holder["line"] = raw.decode("utf-8", errors="replace").strip()
-            except Exception as e:  # noqa: BLE001
-                err_holder["e"] = e
-
-        t = threading.Thread(target=reader, daemon=True)
-        t.start()
-        t.join(timeout=self._cfg.start_timeout)
-        if t.is_alive():
+        loop = asyncio.get_running_loop()
+        try:
+            raw = await asyncio.wait_for(
+                loop.run_in_executor(None, stdout.readline),
+                timeout=self._cfg.start_timeout,
+            )
+        except asyncio.TimeoutError:
             self._proc.kill()
             raise StartTimeout(
-                f"plugin did not emit a handshake within {self._cfg.start_timeout}s")
-        if "e" in err_holder:
-            raise err_holder["e"]
-        return line_holder["line"]
+                f"plugin did not emit a handshake within {self._cfg.start_timeout}s"
+            )
+        if not raw:
+            raise ProcessExitedError("plugin exited before sending handshake")
+        return raw.decode("utf-8", errors="replace").strip()
 
     def _validate_handshake(self, h: HandshakeLine) -> None:
-        # Negotiate plugin set.
         if _is_versioned(self._cfg.plugins):
             versioned: dict[int, PluginSet] = self._cfg.plugins  # type: ignore[assignment]
             if h.app_protocol_version not in versioned:
@@ -321,7 +306,6 @@ class Client:
     def _reattach(self) -> None:
         r = self._cfg.reattach
         assert r is not None
-        # Synthesize a HandshakeLine for downstream code.
         cert_b64 = ""
         if r.server_cert_pem is not None:
             from cryptography import x509
@@ -350,73 +334,66 @@ class Client:
                 "cert_der": b"",
             }
 
-    def _dial(self) -> None:
+    async def _dial(self) -> None:
         h = self._handshake
         assert h is not None
-        target = transport.grpc_dial_target(h.network, h.address)
 
         if h.server_cert and self._tls is not None:
             server_cert_der = mtls.decode_handshake_cert(h.server_cert)
             server_cert_pem = mtls.der_to_pem(server_cert_der)
-            creds = grpc.ssl_channel_credentials(
-                root_certificates=server_cert_pem,
-                private_key=self._tls["key_pem"],
-                certificate_chain=self._tls["cert_pem"],
+            self._client_ssl = mtls.client_ssl_context(
+                cert_pem=self._tls["cert_pem"],
+                key_pem=self._tls["key_pem"],
+                peer_cert_pem=server_cert_pem,
             )
-            options = list(self._cfg.grpc_options) + [
-                ("grpc.ssl_target_name_override", "localhost"),
-            ]
-            self._channel = grpc.secure_channel(target, creds, options=options)
-            # Configure broker tls so brokered sub-channels also use mTLS.
-            self._channel_tls = {
-                "root": server_cert_pem,
-                "client_cert": self._tls["cert_pem"],
-                "client_key": self._tls["key_pem"],
-            }
         elif h.server_cert and self._tls is None:
             raise HandshakeError(
                 "plugin advertised AutoMTLS but client wasn't configured for it")
+
+        cfg = Configuration(ssl_target_name_override="localhost") if self._client_ssl else None
+        if h.network == "unix":
+            self._channel = Channel(path=h.address, ssl=self._client_ssl, config=cfg)
         else:
-            self._channel = grpc.insecure_channel(target, options=self._cfg.grpc_options)
-            self._channel_tls = None
+            host, port = h.address.split(":")
+            self._channel = Channel(host=host, port=int(port), ssl=self._client_ssl, config=cfg)
 
         # Health check — match go-plugin's ping (Service: "plugin").
-        deadline = time.monotonic() + min(self._cfg.start_timeout, 30.0)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + min(self._cfg.start_timeout, 30.0)
         last_err: Exception | None = None
-        while time.monotonic() < deadline:
+        while loop.time() < deadline:
             try:
-                hstub = health_pb2_grpc.HealthStub(self._channel)
-                resp = hstub.Check(
-                    health_pb2.HealthCheckRequest(service=GRPC_HEALTH_SERVICE_NAME),
+                hstub = health_grpc.HealthStub(self._channel)
+                resp = await asyncio.wait_for(
+                    hstub.Check(health_pb2.HealthCheckRequest(service=GRPC_HEALTH_SERVICE_NAME)),
                     timeout=2.0,
                 )
                 if resp.status == health_pb2.HealthCheckResponse.SERVING:
                     last_err = None
                     break
                 last_err = HandshakeError(f"plugin health = {resp.status}")
-            except grpc.RpcError as e:
+            except Exception as e:  # noqa: BLE001
                 last_err = e
-                time.sleep(0.05)
+                await asyncio.sleep(0.05)
         if last_err is not None:
             raise HandshakeError(f"plugin health check failed: {last_err}")
 
-        # Start broker.
-        self._broker, self._broker_thread = make_client_side_broker(self._channel)
-        if self._channel_tls is not None:
-            self._broker.configure_tls(
-                root_cert_pem=self._channel_tls["root"],
-                client_cert_pem=self._channel_tls["client_cert"],
-                client_key_pem=self._channel_tls["client_key"],
+        # Start broker stream.
+        broker_tls: TLSMaterial | None = None
+        if self._client_ssl is not None and self._tls is not None and h.server_cert:
+            broker_tls = TLSMaterial(
+                cert_pem=self._tls["cert_pem"],
+                key_pem=self._tls["key_pem"],
+                peer_cert_pem=mtls.der_to_pem(mtls.decode_handshake_cert(h.server_cert)),
             )
-        self._broker_thread.start()
+        self._broker, self._broker_task = make_client_side_broker(self._channel, broker_tls)
 
-    def _forward_stderr(self, stream) -> None:
-        try:
-            for raw in iter(stream.readline, b""):
-                if not raw:
-                    break
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                if line:
-                    logging_bridge.emit(self._stderr_logger, line)
-        except Exception:  # noqa: BLE001
-            return
+    async def _forward_stderr(self, stream) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            raw = await loop.run_in_executor(None, stream.readline)
+            if not raw:
+                return
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            if line:
+                logging_bridge.emit(self._stderr_logger, line)

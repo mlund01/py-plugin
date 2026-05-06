@@ -1,230 +1,225 @@
-"""GRPCBroker — bidirectional sub-channel multiplexer.
+"""GRPCBroker — bidi sub-channel multiplexer (grpclib async).
 
-go-plugin uses a single bidi gRPC stream (``GRPCBroker.StartStream``) to
-negotiate addresses for additional gRPC channels in either direction. The
-host or plugin asks the other side to open a listener with a service id;
-the other side replies with a ``ConnInfo`` carrying the new listener's
-address; the requester then dials it.
+Same semantics as go-plugin's non-multiplexed broker: ``accept_and_serve(id, …)``
+opens a fresh listener and sends a ``ConnInfo`` over the broker stream;
+``dial(id)`` waits for that ``ConnInfo`` and opens a channel to the address.
+A demux task pumps inbound stream messages into per-id ``asyncio.Queue``s.
 
-This implementation does NOT do socket multiplexing (that's the
-``PLUGIN_MULTIPLEX_GRPC`` mode). Each sub-channel is a fresh listener,
-matching the ``b.muxer == nil`` path in go-plugin's ``grpc_broker.go``.
+Multiplexing the broker over the main socket (``PLUGIN_MULTIPLEX_GRPC``) is
+not implemented — we always advertise ``false`` if the env var is set.
+
+Sub-channels use mTLS reusing the same cert material as the main channel:
+each side has its leaf cert and key, plus the peer's cert pinned as trust root.
+We hold those PEMs on the broker so we can build the correct SSL context
+(server-side for ``accept_and_serve``, client-side for ``dial``).
 """
 from __future__ import annotations
 
+import asyncio
 import itertools
-import queue
-import threading
-from typing import Callable, Optional
+import ssl
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Optional
 
-import grpc
+from grpclib.client import Channel
+from grpclib.config import Configuration
+from grpclib.server import Server, Stream
 
-from ._generated import grpc_broker_pb2, grpc_broker_pb2_grpc
-from .transport import grpc_dial_target, open_listener
+from . import mtls
+from ._generated import grpc_broker_grpc, grpc_broker_pb2
+from .transport import open_listener
 
 
 _DIAL_TIMEOUT = 5.0
 
 
-class _PendingStream:
-    __slots__ = ("ch", "done")
+@dataclass(frozen=True)
+class TLSMaterial:
+    """PEM bytes used to derive per-direction SSL contexts."""
+    cert_pem: bytes
+    key_pem: bytes
+    peer_cert_pem: bytes
+
+
+class _ServerStreamServicer(grpc_broker_grpc.GRPCBrokerBase):
+    """Plugin-side bridge: pumps a single bidi stream into per-side queues."""
 
     def __init__(self) -> None:
-        self.ch: queue.Queue[grpc_broker_pb2.ConnInfo] = queue.Queue(maxsize=1)
-        self.done = threading.Event()
+        self.incoming: asyncio.Queue[grpc_broker_pb2.ConnInfo | None] = asyncio.Queue()
+        self.outgoing: asyncio.Queue[grpc_broker_pb2.ConnInfo | None] = asyncio.Queue()
+        self.connected = asyncio.Event()
 
+    async def StartStream(self, stream: Stream) -> None:  # noqa: N802
+        self.connected.set()
 
-class _BrokerStreamServicer(grpc_broker_pb2_grpc.GRPCBrokerServicer):
-    """Server side of the bidi stream.
-
-    Bridges the gRPC stream to two queues:
-    * ``incoming`` — every ``ConnInfo`` received from the peer.
-    * ``outgoing`` — ``ConnInfo``s the broker wants to send to the peer.
-    A single sender thread pulls from ``outgoing`` and ``yield``s.
-    """
-
-    def __init__(self) -> None:
-        self.incoming: queue.Queue[grpc_broker_pb2.ConnInfo] = queue.Queue()
-        self.outgoing: queue.Queue[Optional[grpc_broker_pb2.ConnInfo]] = queue.Queue()
-        self._connected = threading.Event()
-
-    def StartStream(self, request_iterator, context):  # noqa: N802
-        self._connected.set()
-
-        def reader():
+        async def reader() -> None:
             try:
-                for msg in request_iterator:
-                    self.incoming.put(msg)
+                async for msg in stream:
+                    await self.incoming.put(msg)
             finally:
-                self.incoming.put(None)  # type: ignore[arg-type]
+                await self.incoming.put(None)
 
-        t = threading.Thread(target=reader, name="broker-reader", daemon=True)
-        t.start()
+        async def writer() -> None:
+            while True:
+                msg = await self.outgoing.get()
+                if msg is None:
+                    return
+                await stream.send_message(msg)
 
-        while True:
-            msg = self.outgoing.get()
-            if msg is None:
-                return
-            yield msg
-
-    def wait_connected(self, timeout: float | None = None) -> bool:
-        return self._connected.wait(timeout=timeout)
-
-    def send(self, msg: grpc_broker_pb2.ConnInfo) -> None:
-        self.outgoing.put(msg)
-
-    def close(self) -> None:
-        self.outgoing.put(None)
+        await asyncio.gather(reader(), writer(), return_exceptions=True)
 
 
 class GRPCBroker:
-    """Public broker facade. Lives on both host and plugin sides.
+    """Public broker facade. Lives on both host and plugin sides."""
 
-    On the plugin side, the broker is constructed around a server-side
-    bidi stream (the broker IS the gRPC server endpoint). On the host
-    side, it dials ``GRPCBrokerStub.StartStream`` and pumps the same.
-
-    Either side may call :meth:`accept_and_serve` (open a new listener and
-    serve a registered gRPC server on it) or :meth:`dial` (open a channel
-    to a sub-stream the peer has opened).
-    """
-
-    def __init__(self, *, send: Callable[[grpc_broker_pb2.ConnInfo], None], close: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        *,
+        send: Callable[[grpc_broker_pb2.ConnInfo], Awaitable[None]],
+        close: Callable[[], None],
+        tls: Optional[TLSMaterial] = None,
+    ) -> None:
         self._send = send
         self._close = close
-        self._lock = threading.Lock()
-        self._pending: dict[int, _PendingStream] = {}
+        self._tls = tls
+        self._lock = asyncio.Lock()
+        self._pending: dict[int, asyncio.Queue[grpc_broker_pb2.ConnInfo]] = {}
         self._next_id = itertools.count(1)
         self._closed = False
-        self._tls_root: bytes | None = None
-        self._tls_client_cert: bytes | None = None
-        self._tls_client_key: bytes | None = None
-
-    def configure_tls(self, *, root_cert_pem: bytes, client_cert_pem: bytes | None = None,
-                      client_key_pem: bytes | None = None) -> None:
-        self._tls_root = root_cert_pem
-        self._tls_client_cert = client_cert_pem
-        self._tls_client_key = client_key_pem
+        self._servers: list[Server] = []
 
     def next_id(self) -> int:
         return next(self._next_id)
 
-    def _pending_for(self, sid: int) -> _PendingStream:
-        with self._lock:
-            p = self._pending.get(sid)
-            if p is None:
-                p = _PendingStream()
-                self._pending[sid] = p
-            return p
+    def _q_for(self, sid: int) -> asyncio.Queue[grpc_broker_pb2.ConnInfo]:
+        q = self._pending.get(sid)
+        if q is None:
+            q = asyncio.Queue(maxsize=1)
+            self._pending[sid] = q
+        return q
 
-    def deliver(self, msg: grpc_broker_pb2.ConnInfo) -> None:
-        """Called by the run loop for every incoming message from the peer."""
-        p = self._pending_for(msg.service_id)
+    async def deliver(self, msg: grpc_broker_pb2.ConnInfo) -> None:
+        """Run-loop callback — push an incoming message onto the per-id queue."""
+        q = self._q_for(msg.service_id)
         try:
-            p.ch.put_nowait(msg)
-        except queue.Full:
-            pass
+            q.put_nowait(msg)
+        except asyncio.QueueFull:
+            pass  # drop duplicate Knock/ack — not used for non-mux model
 
-    def accept_and_serve(self, service_id: int, register: Callable[[grpc.Server], None]) -> grpc.Server:
-        """Open a new listener and start a gRPC server on it for ``service_id``.
+    def _server_ssl(self) -> Optional[ssl.SSLContext]:
+        if self._tls is None:
+            return None
+        return mtls.server_ssl_context(
+            cert_pem=self._tls.cert_pem,
+            key_pem=self._tls.key_pem,
+            peer_cert_pem=self._tls.peer_cert_pem,
+        )
 
-        Returns the running ``grpc.Server`` (caller can stop it). Sends the
-        listener's address to the peer on the broker stream so the peer's
-        :meth:`dial` can reach it.
-        """
-        from concurrent import futures
+    def _client_ssl(self) -> Optional[ssl.SSLContext]:
+        if self._tls is None:
+            return None
+        return mtls.client_ssl_context(
+            cert_pem=self._tls.cert_pem,
+            key_pem=self._tls.key_pem,
+            peer_cert_pem=self._tls.peer_cert_pem,
+        )
+
+    async def accept_and_serve(self, service_id: int, servicers: list) -> Server:
+        """Open a fresh listener, run a grpclib ``Server`` on it for ``service_id``,
+        and notify the peer via the broker stream."""
         listener = open_listener()
-        server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
-        register(server)
-        if self._tls_root is not None:
-            from grpc import ssl_server_credentials
-            creds = ssl_server_credentials(
-                [(self._tls_client_key or b"", self._tls_client_cert or b"")],
-                root_certificates=self._tls_root,
-                require_client_auth=True,
-            )
-            server.add_secure_port(listener.grpc_target, creds)
+        server = Server(servicers)
+        srv_ssl = self._server_ssl()
+        if listener.network == "unix":
+            await server.start(path=listener.address, ssl=srv_ssl)
         else:
-            server.add_insecure_port(listener.grpc_target)
-        server.start()
-
-        self._send(grpc_broker_pb2.ConnInfo(
+            host, port = listener.address.split(":")
+            await server.start(host=host, port=int(port), ssl=srv_ssl)
+        self._servers.append(server)
+        await self._send(grpc_broker_pb2.ConnInfo(
             service_id=service_id, network=listener.network, address=listener.address,
         ))
         return server
 
-    def dial(self, service_id: int, *, timeout: float = _DIAL_TIMEOUT) -> grpc.Channel:
-        """Wait for the peer's accept and dial a channel to it."""
-        p = self._pending_for(service_id)
+    async def dial(self, service_id: int, *, timeout: float = _DIAL_TIMEOUT) -> Channel:
+        """Wait for the peer's ``ConnInfo`` for ``service_id`` and open a channel."""
+        q = self._q_for(service_id)
         try:
-            ci = p.ch.get(timeout=timeout)
-        except queue.Empty as e:
+            ci = await asyncio.wait_for(q.get(), timeout=timeout)
+        except asyncio.TimeoutError as e:
             raise TimeoutError(f"timeout waiting for broker conn info for id {service_id}") from e
-        target = grpc_dial_target(ci.network, ci.address)
-        if self._tls_root is not None:
-            from grpc import ssl_channel_credentials, secure_channel
-            creds = ssl_channel_credentials(
-                root_certificates=self._tls_root,
-                private_key=self._tls_client_key,
-                certificate_chain=self._tls_client_cert,
-            )
-            return secure_channel(target, creds, options=(("grpc.ssl_target_name_override", "localhost"),))
-        return grpc.insecure_channel(target)
 
-    def close(self) -> None:
+        cli_ssl = self._client_ssl()
+        cfg = Configuration(ssl_target_name_override="localhost") if cli_ssl else None
+        if ci.network == "unix":
+            return Channel(path=ci.address, ssl=cli_ssl, config=cfg)
+        host, port = ci.address.split(":")
+        return Channel(host=host, port=int(port), ssl=cli_ssl, config=cfg)
+
+    async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        for srv in self._servers:
+            srv.close()
+            try:
+                await srv.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
         self._close()
 
 
-# ---------------------------------------------------------------------------
-# Run-loops bridging stream <-> broker for each side.
-# ---------------------------------------------------------------------------
+def make_server_side_broker(tls: TLSMaterial | None) -> tuple[_ServerStreamServicer, GRPCBroker, "asyncio.Task[None]"]:
+    """Build (servicer, broker, demux-task) for the plugin side."""
+    servicer = _ServerStreamServicer()
 
-def make_server_side_broker() -> tuple[_BrokerStreamServicer, GRPCBroker, threading.Thread]:
-    """Build the (servicer, broker, demux-thread) trio for the plugin side."""
-    servicer = _BrokerStreamServicer()
-    broker = GRPCBroker(send=servicer.send, close=servicer.close)
-
-    def demux():
-        while True:
-            msg = servicer.incoming.get()
-            if msg is None:
-                return
-            broker.deliver(msg)
-
-    t = threading.Thread(target=demux, name="broker-demux-server", daemon=True)
-    return servicer, broker, t
-
-
-def make_client_side_broker(channel: grpc.Channel) -> tuple[GRPCBroker, threading.Thread]:
-    """Build (broker, run-thread) for the host side, dialing StartStream."""
-    stub = grpc_broker_pb2_grpc.GRPCBrokerStub(channel)
-    outgoing: queue.Queue[Optional[grpc_broker_pb2.ConnInfo]] = queue.Queue()
-    incoming: queue.Queue[Optional[grpc_broker_pb2.ConnInfo]] = queue.Queue()
-
-    def send(msg: grpc_broker_pb2.ConnInfo) -> None:
-        outgoing.put(msg)
+    async def send(msg: grpc_broker_pb2.ConnInfo) -> None:
+        await servicer.outgoing.put(msg)
 
     def close() -> None:
-        outgoing.put(None)
+        servicer.outgoing.put_nowait(None)
 
-    broker = GRPCBroker(send=send, close=close)
+    broker = GRPCBroker(send=send, close=close, tls=tls)
 
-    def request_iter():
+    async def demux() -> None:
         while True:
-            m = outgoing.get()
-            if m is None:
+            msg = await servicer.incoming.get()
+            if msg is None:
                 return
-            yield m
+            await broker.deliver(msg)
 
-    def runner():
-        try:
-            for msg in stub.StartStream(request_iter()):
-                broker.deliver(msg)
-        except grpc.RpcError:
-            return
+    return servicer, broker, asyncio.ensure_future(demux())
 
-    t = threading.Thread(target=runner, name="broker-client", daemon=True)
-    return broker, t
+
+def make_client_side_broker(channel: Channel, tls: TLSMaterial | None) -> tuple[GRPCBroker, "asyncio.Task[None]"]:
+    """Build (broker, run-task) for the host side, dialing StartStream."""
+    stub = grpc_broker_grpc.GRPCBrokerStub(channel)
+    outgoing: asyncio.Queue[grpc_broker_pb2.ConnInfo | None] = asyncio.Queue()
+    stream_holder: dict = {}
+
+    async def send(msg: grpc_broker_pb2.ConnInfo) -> None:
+        await outgoing.put(msg)
+
+    def close() -> None:
+        outgoing.put_nowait(None)
+
+    broker = GRPCBroker(send=send, close=close, tls=tls)
+
+    async def runner() -> None:
+        async with stub.StartStream.open() as stream:
+            stream_holder["stream"] = stream
+
+            async def writer() -> None:
+                while True:
+                    msg = await outgoing.get()
+                    if msg is None:
+                        return
+                    await stream.send_message(msg)
+
+            async def reader() -> None:
+                async for msg in stream:
+                    await broker.deliver(msg)
+
+            await asyncio.gather(writer(), reader(), return_exceptions=True)
+
+    return broker, asyncio.ensure_future(runner())

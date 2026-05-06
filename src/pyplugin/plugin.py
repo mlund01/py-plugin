@@ -1,10 +1,11 @@
-"""Plugin ABC and type aliases.
+"""Plugin ABC and type aliases (grpclib version).
 
-A pyplugin user implements one ``Plugin`` subclass per service exposed.
-``grpc_server`` registers the gRPC service on the plugin-side server;
-``grpc_client`` builds a stub on the host side from an open channel.
+A pyplugin author implements one ``Plugin`` subclass per service exposed.
+``servicers`` returns the grpclib ``Base`` instances to register on the
+plugin-side server; ``stub`` builds a typed client stub on the host side
+from an open ``grpclib.client.Channel``.
 
-Mirrors go-plugin's ``GRPCPlugin`` interface — both methods take the
+Mirrors go-plugin's ``GRPCPlugin`` interface — both methods receive the
 ``GRPCBroker`` so plugins can request callbacks back into the host.
 """
 from __future__ import annotations
@@ -12,7 +13,7 @@ from __future__ import annotations
 import abc
 from typing import Any, Mapping, TYPE_CHECKING
 
-import grpc
+from grpclib.client import Channel
 
 if TYPE_CHECKING:
     from .broker import GRPCBroker
@@ -22,12 +23,15 @@ class Plugin(abc.ABC):
     """Abstract base for a plugin type."""
 
     @abc.abstractmethod
-    def grpc_server(self, broker: "GRPCBroker", server: grpc.Server) -> None:
-        """Register this plugin's gRPC service on ``server`` (plugin-side)."""
+    def servicers(self, broker: "GRPCBroker") -> list:
+        """Return grpclib servicer instances to register on the plugin server.
+
+        Called once on the plugin side during ``serve()`` setup.
+        """
 
     @abc.abstractmethod
-    def grpc_client(self, broker: "GRPCBroker", channel: grpc.Channel) -> Any:
-        """Build a typed client stub from an open gRPC channel (host-side)."""
+    def stub(self, broker: "GRPCBroker", channel: Channel) -> Any:
+        """Build a typed grpclib client stub from an open channel (host side)."""
 
 
 PluginSet = Mapping[str, Plugin]

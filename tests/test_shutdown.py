@@ -39,29 +39,29 @@ def _await_dead(pid: int, timeout: float = 3.0) -> bool:
     return False
 
 
-def test_graceful_shutdown():
+async def test_graceful_shutdown():
     c = _client(GRACEFUL_PLUGIN)
-    c.start()
+    await c.start()
     pid = c.pid
     assert pid is not None
-    c.kill()
+    await c.kill()
     assert _await_dead(pid)
 
 
-def test_stubborn_falls_back_to_sigterm():
+async def test_stubborn_falls_back_to_sigterm():
     c = _client(STUBBORN_PLUGIN, kill_timeout=0.5)
-    c.start()
+    await c.start()
     pid = c.pid
     assert pid is not None
-    c.kill()
+    await c.kill()
     assert _await_dead(pid)
 
 
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="SIGTERM-ignore not portable")
-def test_zombie_requires_sigkill():
+async def test_zombie_requires_sigkill():
     c = _client(ZOMBIE_PLUGIN, kill_timeout=0.5)
-    c.start()
+    await c.start()
     pid = c.pid
     assert pid is not None
-    c.kill()
+    await c.kill()
     assert _await_dead(pid, timeout=5.0)

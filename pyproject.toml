@@ -11,19 +11,21 @@ requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "Max Lund" }]
 dependencies = [
-    "grpcio>=1.60",
-    "grpcio-health-checking>=1.60",
-    "grpcio-reflection>=1.60",
+    "grpclib[protobuf]>=0.4.7",
     "protobuf>=4.25",
     "cryptography>=41",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "grpcio-tools>=1.60",
+    "grpcio-tools>=1.60",   # for protoc only; runtime is grpclib
     "pytest>=7",
+    "pytest-asyncio>=0.23",
     "pytest-timeout>=2.2",
 ]
+
+[tool.pytest_asyncio]
+mode = "auto"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pyplugin"]
@@ -32,3 +34,5 @@ packages = ["src/pyplugin"]
 testpaths = ["tests"]
 timeout = 30
 addopts = "-q"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

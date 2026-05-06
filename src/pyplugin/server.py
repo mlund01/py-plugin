@@ -1,48 +1,49 @@
-"""Plugin-side ``serve()`` entry point.
+"""Plugin-side ``serve()`` entry point (grpclib async).
 
-Mirrors go-plugin's ``Serve(opts *ServeConfig)``:
+Mirrors go-plugin's ``Serve(opts *ServeConfig)`` lifecycle:
 
 1. Validate magic cookie (or skip in test mode).
-2. Negotiate the protocol version against ``PLUGIN_PROTOCOL_VERSIONS``.
-3. Open a listener (unix on POSIX, TCP on Windows).
-4. Build a gRPC server, with mTLS if ``PLUGIN_CLIENT_CERT`` is set.
-5. Register: grpc.health (service name = "plugin"), reflection, GRPCBroker,
-   GRPCController, GRPCStdio, then each user plugin via ``Plugin.grpc_server``.
-6. Emit the handshake line to stdout, flush.
-7. Block until the controller's ``Shutdown`` event fires (or ``SIGINT/SIGTERM``).
+2. Negotiate protocol version against ``PLUGIN_PROTOCOL_VERSIONS``.
+3. Open a listener (unix on POSIX, TCP loopback on Windows or when forced).
+4. Build SSL context if ``PLUGIN_CLIENT_CERT`` is set (AutoMTLS).
+5. Collect servicers: GRPCBroker + GRPCController + GRPCStdio + Health
+   (service name = "plugin") + reflection + each user plugin.
+6. Build ``grpclib.server.Server`` and start it on the listener.
+7. Emit the handshake line to stdout, flush.
+8. Block until ``GRPCController.Shutdown`` fires or SIGTERM is received.
+
+``serve()`` is sync from the caller's perspective; it spins up its own
+asyncio event loop. Plugin authors implement async servicers but call
+``serve(config)`` from a normal ``main()``.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import signal
+import ssl
 import sys
-from concurrent import futures
 from dataclasses import dataclass, field
-from typing import Mapping, Optional, Union
+from typing import Optional, Union
 
-import grpc
-from grpc_health.v1 import health, health_pb2, health_pb2_grpc
-from grpc_reflection.v1alpha import reflection
+from grpclib.reflection.service import ServerReflection
+from grpclib.server import Server
 
 from . import mtls, transport
-from ._generated import (
-    grpc_broker_pb2_grpc,
-    grpc_controller_pb2_grpc,
-    grpc_stdio_pb2_grpc,
-)
-from .broker import make_server_side_broker
+from .broker import TLSMaterial, make_server_side_broker
 from .controller import GRPCControllerServicer
 from .cookie import validate_or_exit
-from .stdio import GRPCStdioServicer
+from .health import StaticHealth
 from .handshake import (
     HandshakeConfig,
     PROTOCOL_GRPC,
     format_line,
 )
 from .plugin import Plugin, PluginSet, VersionedPlugins
+from .stdio import GRPCStdioServicer
 
-GRPC_HEALTH_SERVICE_NAME = "plugin"  # what go-plugin's host pings — must match
+GRPC_HEALTH_SERVICE_NAME = "plugin"  # what the go-plugin host pings
 ENV_CLIENT_CERT = "PLUGIN_CLIENT_CERT"
 ENV_PROTOCOL_VERSIONS = "PLUGIN_PROTOCOL_VERSIONS"
 ENV_MULTIPLEX_GRPC = "PLUGIN_MULTIPLEX_GRPC"
@@ -55,13 +56,18 @@ class ServeConfig:
     plugins: Union[PluginSet, VersionedPlugins]
     logger: Optional[logging.Logger] = None
     test_mode: bool = False
-    grpc_max_workers: int = 64
     force_tcp: bool = False
     grpc_options: list = field(default_factory=list)
 
 
+def _is_versioned(p: Union[PluginSet, VersionedPlugins]) -> bool:
+    if not p:
+        return False
+    return all(isinstance(k, int) for k in p.keys())
+
+
 def _negotiate_version(cfg: ServeConfig) -> tuple[int, PluginSet]:
-    """Pick (version, PluginSet) — mirroring go-plugin's protocolVersion()."""
+    """Pick (version, PluginSet) — mirrors go-plugin's protocolVersion()."""
     versioned: dict[int, PluginSet] = {}
     if _is_versioned(cfg.plugins):
         versioned.update(cfg.plugins)  # type: ignore[arg-type]
@@ -81,101 +87,75 @@ def _negotiate_version(cfg: ServeConfig) -> tuple[int, PluginSet]:
         if v in client_versions:
             return v, versioned[v]
 
-    # No overlap — return the lowest server version so the client can produce
-    # a friendly error (matches go-plugin).
     fallback = sorted(versioned.keys())[0]
     return fallback, versioned[fallback]
 
 
-def _is_versioned(p: Union[PluginSet, VersionedPlugins]) -> bool:
-    if not p:
-        return False
-    return all(isinstance(k, int) for k in p.keys())
-
-
-def serve(config: ServeConfig) -> None:
-    """Run the plugin server. Blocks until shutdown. Plugin's ``main()`` calls this."""
-    if not config.test_mode:
-        validate_or_exit(config.handshake_config)
-
+async def _serve_async(config: ServeConfig) -> None:
     logger = config.logger or logging.getLogger("pyplugin.server")
-    proto_version, plugin_set = _negotiate_version(config)
 
+    proto_version, plugin_set = _negotiate_version(config)
     listener = transport.open_listener(force_tcp=config.force_tcp)
 
     # AutoMTLS — match server.go: read PLUGIN_CLIENT_CERT, generate our cert,
     # trust the host's cert as both client CA and root.
     server_cert_b64 = ""
-    server_credentials: Optional[grpc.ServerCredentials] = None
-    server_cert_obj: Optional[mtls.Cert] = None
+    server_ssl: Optional[ssl.SSLContext] = None
+    server_cert: Optional[mtls.Cert] = None
     client_cert_pem = os.environ.get(ENV_CLIENT_CERT)
     if client_cert_pem:
-        server_cert_obj = mtls.generate()
-        server_cert_b64 = mtls.encode_handshake_cert(server_cert_obj.cert_der)
-        server_credentials = grpc.ssl_server_credentials(
-            [(server_cert_obj.key_pem, server_cert_obj.cert_pem)],
-            root_certificates=client_cert_pem.encode(),
-            require_client_auth=True,
+        server_cert = mtls.generate()
+        server_cert_b64 = mtls.encode_handshake_cert(server_cert.cert_der)
+        server_ssl = mtls.server_ssl_context(
+            cert_pem=server_cert.cert_pem,
+            key_pem=server_cert.key_pem,
+            peer_cert_pem=client_cert_pem.encode(),
         )
 
-    # Build gRPC server.
-    grpc_server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=config.grpc_max_workers),
-        options=config.grpc_options,
-    )
-    if server_credentials is not None:
-        grpc_server.add_secure_port(listener.grpc_target, server_credentials)
-    else:
-        grpc_server.add_insecure_port(listener.grpc_target)
-
-    # Health check — go-plugin's host pings the "plugin" service.
-    health_servicer = health.HealthServicer()
-    health_servicer.set(GRPC_HEALTH_SERVICE_NAME, health_pb2.HealthCheckResponse.SERVING)
-    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, grpc_server)
-
-    # Broker + controller + (later) stdio.
-    broker_servicer, broker, demux_thread = make_server_side_broker()
-    if server_cert_obj is not None and client_cert_pem:
-        broker.configure_tls(
-            root_cert_pem=client_cert_pem.encode(),
-            client_cert_pem=server_cert_obj.cert_pem,
-            client_key_pem=server_cert_obj.key_pem,
+    # Build the broker's servicer + facade; the demux task we'll start under
+    # this same event loop.
+    broker_tls: Optional[TLSMaterial] = None
+    if server_cert is not None and client_cert_pem:
+        broker_tls = TLSMaterial(
+            cert_pem=server_cert.cert_pem,
+            key_pem=server_cert.key_pem,
+            peer_cert_pem=client_cert_pem.encode(),
         )
-    grpc_broker_pb2_grpc.add_GRPCBrokerServicer_to_server(broker_servicer, grpc_server)
-    demux_thread.start()
+    broker_servicer, broker, demux_task = make_server_side_broker(broker_tls)
 
     controller = GRPCControllerServicer()
-    grpc_controller_pb2_grpc.add_GRPCControllerServicer_to_server(controller, grpc_server)
-
     stdio_servicer = GRPCStdioServicer()
-    grpc_stdio_pb2_grpc.add_GRPCStdioServicer_to_server(stdio_servicer, grpc_server)
+    health = StaticHealth()
 
-    # Register user plugins.
-    service_names: list[str] = [
-        health_pb2.DESCRIPTOR.services_by_name["Health"].full_name,
-        "plugin.GRPCBroker",
-        "plugin.GRPCController",
-        "plugin.GRPCStdio",
-    ]
+    user_servicers: list = []
     for name, p in plugin_set.items():
         if not isinstance(p, Plugin):
             raise TypeError(f"plugin {name!r} must be a pyplugin.Plugin instance")
-        p.grpc_server(broker, grpc_server)
+        user_servicers.extend(p.servicers(broker))
 
-    # Reflection (covers user plugins because we register after them).
-    try:
-        reflection.enable_server_reflection(service_names, grpc_server)
-    except Exception:  # noqa: BLE001 — reflection failure shouldn't kill the plugin
-        logger.debug("reflection setup failed", exc_info=True)
+    base_servicers: list = [
+        broker_servicer,
+        controller,
+        stdio_servicer,
+        health,
+    ] + user_servicers
 
-    grpc_server.start()
+    # Reflection extends the servicer list with its own service.
+    all_servicers = ServerReflection.extend(base_servicers)
 
-    # Emit the handshake. Go-plugin always emits 6 segments; if the multiplex
-    # env opt-in is present, append a 7th. We don't *implement* multiplex
-    # for v1 but we still advertise truthfully (false).
+    server = Server(all_servicers)
+    if listener.network == "unix":
+        await server.start(path=listener.address, ssl=server_ssl)
+    else:
+        host, port = listener.address.split(":")
+        await server.start(host=host, port=int(port), ssl=server_ssl)
+
+    # Emit handshake. go-plugin always emits 6 segments; if PLUGIN_MULTIPLEX_GRPC
+    # is set, the 7th tells the host whether we *support* mux. We don't, so we
+    # advertise false (opt-out) — the host will then fail loudly if it required it.
     multiplex: Optional[bool] = None
     if os.environ.get(ENV_MULTIPLEX_GRPC):
-        multiplex = False  # we don't yet support muxing the broker over the main socket
+        multiplex = False
     line = format_line(
         app_protocol_version=proto_version,
         network=listener.network,
@@ -188,23 +168,37 @@ def serve(config: ServeConfig) -> None:
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
 
-    # Suppress SIGINT — go-plugin "eats" interrupts so the host owns the
-    # shutdown sequence. SIGTERM still terminates by default.
+    # Suppress SIGINT — go-plugin "eats" interrupts so the host owns shutdown.
+    # SIGTERM still triggers shutdown via the signal handler below.
+    loop = asyncio.get_running_loop()
     if not config.test_mode:
         try:
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
-        except (ValueError, OSError):
-            pass
+            loop.add_signal_handler(signal.SIGINT, lambda: None)
+            loop.add_signal_handler(signal.SIGTERM, controller.shutdown_event.set)
+        except (NotImplementedError, RuntimeError):
+            pass  # Windows / non-main thread — best effort
 
     try:
-        controller.shutdown_event.wait()
+        await controller.shutdown_event.wait()
     finally:
-        # GracefulStop the gRPC server, then unlink unix socket if any.
-        grpc_server.stop(grace=2.0).wait(timeout=5.0)
-        broker.close()
+        # GracefulStop the gRPC server, then unlink the unix socket.
+        server.close()
+        try:
+            await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        await broker.close()
         stdio_servicer.close()
+        demux_task.cancel()
         if listener.cleanup_path and os.path.exists(listener.cleanup_path):
             try:
                 os.remove(listener.cleanup_path)
             except OSError:
                 pass
+
+
+def serve(config: ServeConfig) -> None:
+    """Run the plugin server (sync entry point). Plugin's ``main()`` calls this."""
+    if not config.test_mode:
+        validate_or_exit(config.handshake_config)
+    asyncio.run(_serve_async(config))

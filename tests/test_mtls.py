@@ -14,12 +14,12 @@ def _load_pem(pem: bytes) -> x509.Certificate:
     return x509.load_pem_x509_certificate(pem)
 
 
-def test_curve_is_p256():
-    """We swap go-plugin's P-521 for P-256 because BoringSSL/grpcio rejects P-521."""
+def test_curve_is_p521():
+    """Match go-plugin exactly: ECDSA P-521 — works because grpclib uses Python ssl/OpenSSL."""
     cert = _load_pem(mtls.generate().cert_pem)
     pub = cert.public_key()
     assert isinstance(pub, ec.EllipticCurvePublicKey)
-    assert pub.curve.name == "secp256r1"
+    assert pub.curve.name == "secp521r1"
 
 
 def test_san_localhost():

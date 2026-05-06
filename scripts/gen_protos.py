@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Generate Python gRPC stubs from vendored .proto files.
+"""Generate Python protobuf + grpclib stubs from vendored .proto files.
 
-Run with: python scripts/gen_protos.py
+We use ``grpc_tools.protoc`` for the ``*_pb2.py`` (message types) and
+grpclib's protoc plugin (``protoc-gen-grpclib_python``) for the
+``*_grpc.py`` files (service stubs/bases).
 """
 from __future__ import annotations
 
+import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -19,11 +23,15 @@ EXAMPLE_OUT_DIR = ROOT / "fixtures" / "example_kv" / "generated"
 
 def run(out: pathlib.Path, proto_dir: pathlib.Path, files: list[str]) -> None:
     out.mkdir(parents=True, exist_ok=True)
+    plugin_path = shutil.which("protoc-gen-grpclib_python") or str(
+        ROOT / ".venv" / "bin" / "protoc-gen-grpclib_python"
+    )
     cmd = [
         sys.executable, "-m", "grpc_tools.protoc",
         f"-I{proto_dir}",
         f"--python_out={out}",
-        f"--grpc_python_out={out}",
+        f"--grpclib_python_out={out}",
+        f"--plugin=protoc-gen-grpclib_python={plugin_path}",
         *files,
     ]
     print("$", " ".join(cmd))
@@ -32,23 +40,16 @@ def run(out: pathlib.Path, proto_dir: pathlib.Path, files: list[str]) -> None:
 
 
 def rewrite_imports(out: pathlib.Path) -> None:
-    """Rewrite generated absolute imports into relative ones so the dir works as a package."""
-    import re
+    """Rewrite generated absolute imports into relative ones."""
     pat = re.compile(r"^import (\w+_pb2)( as .+)?$", re.M)
-    for py in out.glob("*_pb2_grpc.py"):
+    for py in list(out.glob("*_grpc.py")) + list(out.glob("*_pb2.py")):
         text = py.read_text()
-        text = pat.sub(lambda m: f"from . import {m.group(1)}{m.group(2) or ''}", text)
-        py.write_text(text)
-    for py in out.glob("*_pb2.py"):
-        text = py.read_text()
-        text = pat.sub(lambda m: f"from . import {m.group(1)}{m.group(2) or ''}", text)
-        py.write_text(text)
+        new = pat.sub(lambda m: f"from . import {m.group(1)}{m.group(2) or ''}", text)
+        if new != text:
+            py.write_text(new)
 
 
 def main() -> None:
-    if shutil.which("python") is None:
-        sys.exit("python not on PATH")
-
     run(OUT_DIR, PROTO_DIR, [
         str(PROTO_DIR / "grpc_broker.proto"),
         str(PROTO_DIR / "grpc_controller.proto"),

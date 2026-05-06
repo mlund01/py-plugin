@@ -1,4 +1,4 @@
-"""End-to-end smoke tests for the Greeter/KV plugin."""
+"""End-to-end smoke tests for the KV plugin (Python ↔ Python, async)."""
 from __future__ import annotations
 
 import os
@@ -16,46 +16,42 @@ from fixtures.example_kv.kv_plugin import HANDSHAKE, KVPlugin  # noqa: E402
 from fixtures.example_kv.generated import kv_pb2  # noqa: E402
 
 
-def _client(*, auto_mtls: bool = False, force_tcp: bool = False) -> Client:
-    env = dict(os.environ)
-    if force_tcp:
-        env["PLUGIN_FORCE_TCP"] = "1"
+def _client(*, auto_mtls: bool = False) -> Client:
     return Client(ClientConfig(
         handshake_config=HANDSHAKE,
         plugins={"kv": KVPlugin()},
         cmd=[sys.executable, str(PLUGIN_MAIN)],
         auto_mtls=auto_mtls,
-        env=env,
+        env=dict(os.environ),
         kill_timeout=2.0,
         start_timeout=15.0,
     ))
 
 
-def _round_trip(stub) -> None:
-    stub.Put(kv_pb2.PutRequest(key="hello", value=b"world"))
-    resp = stub.Get(kv_pb2.GetRequest(key="hello"))
+async def _round_trip(stub) -> None:
+    await stub.Put(kv_pb2.PutRequest(key="hello", value=b"world"))
+    resp = await stub.Get(kv_pb2.GetRequest(key="hello"))
     assert resp.value == b"world"
 
 
-def test_unix_socket_no_mtls():
-    with _client(auto_mtls=False) as c:
+async def test_unix_socket_no_mtls():
+    async with _client(auto_mtls=False) as c:
         kv = c.dispense("kv")
-        _round_trip(kv)
+        await _round_trip(kv)
 
 
-def test_auto_mtls():
-    with _client(auto_mtls=True) as c:
+async def test_auto_mtls_p521():
+    async with _client(auto_mtls=True) as c:
         kv = c.dispense("kv")
-        _round_trip(kv)
+        await _round_trip(kv)
 
 
-def test_kill_terminates_process():
+async def test_kill_terminates_process():
     c = _client(auto_mtls=False)
-    c.start()
+    await c.start()
     pid = c.pid
     assert pid is not None
-    c.kill()
-    # Allow up to a few seconds for the OS to reap.
+    await c.kill()
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
         try:

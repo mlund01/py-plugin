@@ -1,21 +1,22 @@
-"""GRPCController.Shutdown servicer — graceful shutdown for the plugin server."""
+"""GRPCController.Shutdown servicer (grpclib async)."""
 from __future__ import annotations
 
-import threading
+import asyncio
 
-from ._generated import grpc_controller_pb2, grpc_controller_pb2_grpc
+from ._generated import grpc_controller_grpc, grpc_controller_pb2
 
 
-class GRPCControllerServicer(grpc_controller_pb2_grpc.GRPCControllerServicer):
-    """Tracks a shutdown event the serve loop blocks on.
+class GRPCControllerServicer(grpc_controller_grpc.GRPCControllerBase):
+    """Sets a shutdown ``asyncio.Event`` when ``Shutdown`` is invoked.
 
-    Mirrors go-plugin's grpcControllerServer: ``Shutdown`` returns immediately,
-    after which the serve loop calls ``server.stop(grace=...)`` and exits.
+    Mirrors go-plugin's grpcControllerServer: ``Shutdown`` returns immediately
+    with Empty; the serve loop awaits the event, then closes the gRPC server.
     """
 
     def __init__(self) -> None:
-        self.shutdown_event = threading.Event()
+        self.shutdown_event = asyncio.Event()
 
-    def Shutdown(self, request, context):  # noqa: N802 — proto method name
+    async def Shutdown(self, stream) -> None:  # noqa: N802
+        await stream.recv_message()
+        await stream.send_message(grpc_controller_pb2.Empty())
         self.shutdown_event.set()
-        return grpc_controller_pb2.Empty()

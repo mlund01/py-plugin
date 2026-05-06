@@ -1,14 +1,7 @@
-"""Plugin variant that ignores the GRPCController.Shutdown RPC.
-
-Used to test the kill ladder: the host must escalate to SIGTERM. The plugin
-*does* honor SIGTERM (Python's default), so this exercises step 2 of the
-ladder.
-"""
+"""Plugin variant that ignores GRPCController.Shutdown — host must escalate to SIGTERM."""
 from __future__ import annotations
 
 import sys
-import threading
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -21,12 +14,11 @@ from fixtures.example_kv.kv_plugin import HANDSHAKE, KVPlugin  # noqa: E402
 
 
 def main() -> None:
-    # Monkey-patch the controller servicer so Shutdown becomes a no-op.
-    original = GRPCControllerServicer.Shutdown
-
-    def ignore(self, request, context):
+    # Override Shutdown to NOT set the shutdown_event.
+    async def ignore(self, stream):
         from pyplugin._generated import grpc_controller_pb2
-        return grpc_controller_pb2.Empty()  # do NOT set shutdown_event
+        await stream.recv_message()
+        await stream.send_message(grpc_controller_pb2.Empty())
 
     GRPCControllerServicer.Shutdown = ignore
 

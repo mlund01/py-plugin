@@ -15,13 +15,14 @@ from fixtures.example_kv.kv_plugin import HANDSHAKE, KVPlugin  # noqa: E402
 
 
 def main() -> None:
-    def ignore(self, request, context):
+    async def ignore(self, stream):
         from pyplugin._generated import grpc_controller_pb2
-        return grpc_controller_pb2.Empty()
+        await stream.recv_message()
+        await stream.send_message(grpc_controller_pb2.Empty())
 
     GRPCControllerServicer.Shutdown = ignore
 
-    # Ignore SIGTERM so the host has to escalate to SIGKILL.
+    # Ignore SIGTERM at the signal level so the host has to escalate to SIGKILL.
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
     from pyplugin import serve
