@@ -23,6 +23,14 @@ host code uses `async with Client(...) as c: await c.start()` etc.
 
 ## Quick start
 
+A complete runnable example lives in [`examples/greeter/`](examples/greeter/) —
+clone the repo, `pip install -e '.[dev]'`, then:
+
+```bash
+python examples/greeter/host.py "ada"            # insecure
+AUTO_MTLS=1 python examples/greeter/host.py "ada" # P-521 mTLS
+```
+
 ### Plugin (async)
 
 ```python
