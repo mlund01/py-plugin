@@ -3,18 +3,41 @@ requires = ["hatchling>=1.21"]
 build-backend = "hatchling.build"
 
 [project]
-name = "pyplugin"
+name = "python-plugin"
 version = "0.1.0"
-description = "Wire-compatible Python port of HashiCorp's go-plugin"
+description = "Wire-compatible Python port of go-plugin (gRPC subprocess plugins with AutoMTLS)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "Max Lund" }]
+keywords = ["go-plugin", "grpc", "plugin", "rpc", "mtls", "ipc"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: AsyncIO",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "grpclib[protobuf]>=0.4.7",
     "protobuf>=4.25",
     "cryptography>=41",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mlund01/py-plugin"
+Repository = "https://github.com/mlund01/py-plugin"
+Issues = "https://github.com/mlund01/py-plugin/issues"
 
 [project.optional-dependencies]
 dev = [
