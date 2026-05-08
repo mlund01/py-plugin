@@ -1,13 +1,22 @@
 # pyplugin
 
-A Python port of [HashiCorp's go-plugin](https://github.com/hashicorp/go-plugin),
+A Python port of [`go-plugin`](https://github.com/hashicorp/go-plugin),
 **byte-for-byte wire-compatible** with the original — including AutoMTLS
 with ECDSA P-521 ephemeral certs.
 
 A Python host can launch a Go plugin built with go-plugin, and a Go host
 built against go-plugin can launch a Python plugin built with pyplugin.
-**Both directions, with or without AutoMTLS.** Verified with HashiCorp's
-own `examples/grpc/plugin-go-grpc` binary in the test suite.
+**Both directions, with or without AutoMTLS.** Verified against the
+upstream `examples/grpc/plugin-go-grpc` binary in the test suite.
+
+## Install
+
+```bash
+pip install python-plugin
+```
+
+The PyPI distribution name is `python-plugin`; the Python import name is
+`pyplugin` (`from pyplugin import Client, serve, ...`).
 
 ## Why grpclib (and async)
 
@@ -103,7 +112,7 @@ asyncio.run(main())
 
 ## Verified Python ↔ Go interop
 
-The test suite includes 4 real interop tests against HashiCorp's go-plugin:
+The test suite includes 4 real interop tests against upstream go-plugin:
 
 ```
 tests/interop/test_python_host_drives_go_plugin.py
